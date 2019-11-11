@@ -26,7 +26,7 @@ from .security import (
     PinTanTwoStepAuthenticationMechanism,
 )
 from .segments.accounts import HISPA1, HKSPA1
-from .segments.auth import HIPINS1, HKTAB4, HKTAB5, HKTAN2, HKTAN3, HKTAN5
+from .segments.auth import HIPINS1, HKTAB4, HKTAB5, HKTAN2, HKTAN3, HKTAN5, HKTAN6
 from .segments.bank import HIBPA3, HIUPA4, HKKOM4
 from .segments.debit import (
     HKDBS1, HKDBS2, HKDMB1, HKDMC1, HKDME1, HKDME2,
@@ -151,8 +151,18 @@ class TransactionResponse:
         return "<{o.__class__.__name__}(status={o.status!r}, responses={o.responses!r}, data={o.data!r})>".format(o=self)
 
 
+class FinTSClientMode(Enum):
+    OFFLINE = 'offline'
+    NONINTERACTIVE = 'noninteractive'
+    INTERACTIVE = 'interactive'
+
+
 class FinTS3Client:
-    def __init__(self, bank_identifier, user_id, customer_id=None, from_data: bytes=None, product_id=None):
+    def __init__(self,
+                 bank_identifier, user_id, customer_id=None,
+                 from_data: bytes=None,
+                 product_id=None, product_version=version[:5],
+                 mode=FinTSClientMode.NONINTERACTIVE):
         self.accounts = []
         if isinstance(bank_identifier, BankIdentifier):
             self.bank_identifier = bank_identifier
@@ -162,9 +172,9 @@ class FinTS3Client:
             raise TypeError("bank_identifier must be BankIdentifier or str (BLZ)")
         self.system_id = SYSTEM_ID_UNASSIGNED
         if not product_id:
-            logger.warn('You should register your program with the ZKA and pass your own product_id as a parameter.')
+            logger.warning('You should register your program with the ZKA and pass your own product_id as a parameter.')
             product_id = 'DC333D745719C4BD6A6F9DB6A'
-        
+
         self.user_id = user_id
         self.customer_id = customer_id or user_id
         self.bpd_version = 0
@@ -174,8 +184,10 @@ class FinTS3Client:
         self.upa = None
         self.upd = SegmentSequence()
         self.product_name = product_id
-        self.product_version = version[:5]
+        self.product_version = product_version
         self.response_callbacks = []
+        self.mode = mode
+        self.init_tan_response = None
         self._standing_dialog = None
 
         if from_data:
@@ -241,7 +253,11 @@ class FinTS3Client:
 
     def __exit__(self, exc_type, exc_value, traceback):
         if self._standing_dialog:
-            self._standing_dialog.__exit__(exc_type, exc_value, traceback)
+            if exc_type is not None and issubclass(exc_type, FinTSSCARequiredError):
+                # In case of SCARequiredError, the dialog has already been closed by the bank
+                self._standing_dialog.open = False
+            else:
+                self._standing_dialog.__exit__(exc_type, exc_value, traceback)
         else:
             raise Exception("Cannot double __exit__() {}".format(self))
 
@@ -435,37 +451,45 @@ class FinTS3Client:
 
         return [a for a in [acc.as_sepa_account() for acc in self.accounts] if a]
 
-    def _fetch_with_touchdowns(self, dialog, segment_factory, *args, **kwargs):
+    def _continue_fetch_with_touchdowns(self, command_seg, response):
+        for resp in response.response_segments(command_seg, *self._touchdown_args, **self._touchdown_kwargs):
+            self._touchdown_responses.append(resp)
+
+        touchdown = None
+        for response in response.responses(command_seg, '3040'):
+            touchdown = response.parameters[0]
+            break
+
+        if touchdown:
+            logger.info('Fetching more results ({})...'.format(self._touchdown_counter))
+
+        self._touchdown_counter += 1
+        if touchdown:
+            seg = self._touchdown_segment_factory(touchdown)
+            return self._send_with_possible_retry(self._touchdown_dialog, seg, self._continue_fetch_with_touchdowns)
+        else:
+            return self._touchdown_response_processor(self._touchdown_responses)
+
+    def _fetch_with_touchdowns(self, dialog, segment_factory, response_processor, *args, **kwargs):
         """Execute a sequence of fetch commands on dialog.
         segment_factory must be a callable with one argument touchdown. Will be None for the
         first call and contains the institute's touchdown point on subsequent calls.
         segment_factory must return a command segment.
+        response_processor can be a callable that will be passed the return value of this function and can
+        return a new value instead.
         Extra arguments will be passed to FinTSMessage.response_segments.
         Return value is a concatenated list of the return values of FinTSMessage.response_segments().
         """
-        responses = []
-        touchdown_counter = 1
-        touchdown = None
-
-        while touchdown or touchdown_counter == 1:
-            seg = segment_factory(touchdown)
-
-            rm = dialog.send(seg)
-
-            for resp in rm.response_segments(seg, *args, **kwargs):
-                responses.append(resp)
-
-            touchdown = None
-            for response in rm.responses(seg, '3040'):
-                touchdown = response.parameters[0]
-                break
-
-            if touchdown:
-                logger.info('Fetching more results ({})...'.format(touchdown_counter))
-
-            touchdown_counter += 1
-
-        return responses
+        self._touchdown_responses = []
+        self._touchdown_counter = 1
+        self._touchdown = None
+        self._touchdown_dialog = dialog
+        self._touchdown_segment_factory = segment_factory
+        self._touchdown_response_processor = response_processor
+        self._touchdown_args = args
+        self._touchdown_kwargs = kwargs
+        seg = segment_factory(self._touchdown)
+        return self._send_with_possible_retry(dialog, seg, self._continue_fetch_with_touchdowns)
 
     def _find_highest_supported_command(self, *segment_classes, **kwargs):
         """Search the BPD for the highest supported version of a segment."""
@@ -500,7 +524,7 @@ class FinTS3Client:
             hkkaz = self._find_highest_supported_command(HKKAZ5, HKKAZ6, HKKAZ7)
 
             logger.info('Start fetching from {} to {}'.format(start_date, end_date))
-            responses = self._fetch_with_touchdowns(
+            response = self._fetch_with_touchdowns(
                 dialog,
                 lambda touchdown: hkkaz(
                     account=hkkaz._fields['account'].type.from_sepa_account(account),
@@ -509,20 +533,17 @@ class FinTS3Client:
                     date_end=end_date,
                     touchdown_point=touchdown,
                 ),
-                'HIKAZ'
+                lambda responses: mt940_to_array(''.join([seg.statement_booked.decode('iso-8859-1') for seg in responses])),
+                'HIKAZ',
+                # Note 1: Some banks send the HIKAZ data in arbitrary splits.
+                # So better concatenate them before MT940 parsing.
+                # Note 2: MT940 messages are encoded in the S.W.I.F.T character set,
+                # which is a subset of ISO 8859. There are no character in it that
+                # differ between ISO 8859 variants, so we'll arbitrarily chose 8859-1.
             )
             logger.info('Fetching done.')
 
-        # Note 1: Some banks send the HIKAZ data in arbitrary splits.
-        # So better concatenate them before MT940 parsing.
-        # Note 2: MT940 messages are encoded in the S.W.I.F.T character set,
-        # which is a subset of ISO 8859. There are no character in it that
-        # differ between ISO 8859 variants, so we'll arbitrarily chose 8859-1.
-        statement = mt940_to_array(''.join([seg.statement_booked.decode('iso-8859-1') for seg in responses]))
-
-        logger.debug('Statement: {}'.format(statement))
-
-        return statement
+        return response
 
     def get_transactions_xml(self, account: SEPAAccount, start_date: datetime.date = None,
                              end_date: datetime.date = None) -> list:
@@ -551,6 +572,7 @@ class FinTS3Client:
                     touchdown_point=touchdown,
                     supported_camt_messages=SupportedMessageTypes(['urn:iso:std:iso:20022:tech:xsd:camt.052.001.02']),
                 ),
+                lambda responses: responses,  # TODO
                 'HICAZ'
             )
             logger.info('Fetching done.')
@@ -576,6 +598,7 @@ class FinTS3Client:
                     date_end=end_date,
                     touchdown_point=touchdown,
                 ),
+                lambda responses: responses,
                 'DIKKU'
             )
 
@@ -619,6 +642,7 @@ class FinTS3Client:
                     account=hkwpd._fields['account'].type.from_sepa_account(account),
                     touchdown_point=touchdown,
                 ),
+                lambda responses: responses,  # TODO
                 'HIWPD'
             )
 
@@ -656,6 +680,7 @@ class FinTS3Client:
                     account=hkdbs._fields['account'].type.from_sepa_account(account),
                     touchdown_point=touchdown,
                 ),
+                lambda responses: responses,
                 response_type,
             )
 
@@ -670,6 +695,7 @@ class FinTS3Client:
                 lambda touchdown: hkpro(
                     touchdown_point=touchdown,
                 ),
+                lambda responses: responses,
                 'HIPRO',
             )
 
@@ -684,6 +710,7 @@ class FinTS3Client:
                 lambda touchdown: hkkom(
                     touchdown_point=touchdown,
                 ),
+                lambda responses: responses,
                 'HIKOM'
             )
 
@@ -801,6 +828,9 @@ class FinTS3Client:
                 retval.responses.append(resp)
 
         return retval
+
+    def _continue_dialog_initialization(self, command_seg, response):
+        return response
 
     def sepa_debit(self, account: SEPAAccount, pain_message: str, multiple=False, cor1=False,
                    control_sum=None, currency='EUR', book_as_single=False,
@@ -1050,6 +1080,7 @@ IMPLEMENTED_HKTAN_VERSIONS = {
     2: HKTAN2,
     3: HKTAN3,
     5: HKTAN5,
+    6: HKTAN6,
 }
 
 
@@ -1062,6 +1093,7 @@ class FinTS3PinTanClient(FinTS3Client):
         self.allowed_security_functions = []
         self.selected_security_function = None
         self.selected_tan_medium = None
+        self._bootstrap_mode = True
         super().__init__(bank_identifier=bank_identifier, user_id=user_id, customer_id=customer_id, *args, **kwargs)
 
     def _new_dialog(self, lazy_init=False):
@@ -1086,6 +1118,12 @@ class FinTS3PinTanClient(FinTS3Client):
             auth_mechanisms=auth,
         )
 
+    def fetch_tan_mechanisms(self):
+        self.set_tan_mechanism('999')
+        self._ensure_system_id()
+        with self._new_dialog():
+            return self.get_current_tan_mechanism()
+
     def _ensure_system_id(self):
         if self.system_id != SYSTEM_ID_UNASSIGNED or self.user_id == CUSTOMER_ID_ANONYMOUS:
             return
@@ -1094,11 +1132,10 @@ class FinTS3PinTanClient(FinTS3Client):
             response = dialog.init(
                 HKSYN3(SynchronizationMode.NEW_SYSTEM_ID),
             )
-
-        seg = response.find_segment_first(HISYN4)
-        if not seg:
-            raise ValueError('Could not find system_id')
-        self.system_id = seg.system_id
+            seg = response.find_segment_first(HISYN4)
+            if not seg:
+                raise ValueError('Could not find system_id')
+            self.system_id = seg.system_id
 
     def _set_data_v1(self, data):
         super()._set_data_v1(data)
@@ -1123,7 +1160,6 @@ class FinTS3PinTanClient(FinTS3Client):
     def _get_tan_segment(self, orig_seg, tan_process, tan_seg=None):
         tan_mechanism = self.get_tan_mechanisms()[self.get_current_tan_mechanism()]
 
-        hitans = self.bpd.find_segment_first('HITANS', tan_mechanism.VERSION)
         hktan = IMPLEMENTED_HKTAN_VERSIONS.get(tan_mechanism.VERSION)
 
         seg = hktan(tan_process=tan_process)
@@ -1138,7 +1174,13 @@ class FinTS3PinTanClient(FinTS3Client):
         if tan_process in ('1', '3', '4') and getattr(tan_mechanism, 'supported_media_number', None) is not None and \
             tan_mechanism.supported_media_number > 1 and \
             tan_mechanism.description_required == DescriptionRequired.MUST:
-                seg.tan_medium_name = self.selected_tan_medium.tan_medium_name
+                if self.selected_tan_medium:
+                    seg.tan_medium_name = self.selected_tan_medium.tan_medium_name
+                else:
+                    seg.tan_medium_name = 'DUMMY'
+
+        if tan_process == '4' and tan_mechanism.VERSION >= 6:
+            seg.segment_type = orig_seg.header.type
 
         if tan_process in ('2', '3'):
             seg.task_reference = tan_seg.task_reference
@@ -1228,7 +1270,7 @@ class FinTS3PinTanClient(FinTS3Client):
             raise FinTSClientError("Error during dialog initialization, could not fetch BPD. Please check that you "
                                    "passed the correct bank identifier to the HBCI URL of the correct bank.")
 
-        if (not dialog.open and response.code.startswith('9')) or response.code in ('9340', '9910', '9930', '9931', '9942'):
+        if ((not dialog.open and response.code.startswith('9')) or response.code in ('9340', '9910', '9930', '9931', '9942')) and not self._bootstrap_mode:
             # Assume all 9xxx errors in a not-yet-open dialog refer to the PIN or authentication
             # During a dialog also listen for the following codes which may explicitly indicate an
             # incorrect pin: 9340, 9910, 9930, 9931, 9942
@@ -1244,6 +1286,13 @@ class FinTS3PinTanClient(FinTS3Client):
             if self.pin:
                 self.pin.block()
             raise FinTSClientTemporaryAuthError("Account is temporarily locked.")
+
+        if response.code == '9075':
+            if self._bootstrap_mode:
+                if self._standing_dialog:
+                    self._standing_dialog.open = False
+            else:
+                raise FinTSSCARequiredError("This operation requires strong customer authentication.")
 
     def get_tan_mechanisms(self):
         """
@@ -1289,8 +1338,13 @@ class FinTS3PinTanClient(FinTS3Client):
                 tan_media_type = media_type,
                 tan_media_class = str(media_class),
             )
+            tan_seg = self._get_tan_segment(seg, '4')
 
-            response = dialog.send(seg)
+            try:
+                self._bootstrap_mode = True
+                response = dialog.send(seg, tan_seg)
+            finally:
+                self._bootstrap_mode = False
 
             for resp in response.response_segments(seg, 'HITAB'):
                 return resp.tan_usage_option, list(resp.tan_media_list)
